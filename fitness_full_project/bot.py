@@ -1,12 +1,21 @@
-# Telegram bot (aiogram)
+# bot.py
+
 import os
 import asyncio
+
+from models import init_db   # <-- ДОБАВЛЕНО!
+
+# Создаём таблицы при старте
+init_db()  # <-- ДОБАВЛЕНО!
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
 from models import SessionLocal, User, Message as DbMessage
 from datetime import datetime
 from pathlib import Path
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(BOT_TOKEN)

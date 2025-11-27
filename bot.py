@@ -1,4 +1,6 @@
 import os
+import io
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -11,13 +13,12 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 
 from PIL import Image, ImageDraw, ImageFont
 
-# ==== опционально: ИИ для советов ====
+# ==== OpenAI (ИИ) ====
 try:
-    import openai  # нужен, если хочешь реальные советы от ИИ
+    import openai  # используем старый клиент 0.28.x
 except ImportError:
     openai = None  # type: ignore
 
-# ==== КОНФИГ ====
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "YOUR_BOT_TOKEN_HERE"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -55,12 +56,9 @@ class FoodEntry:
     fat: float
     carb: float
 
-# user_id -> профиль
 USERS: Dict[int, UserProfile] = {}
-# user_id -> { "YYYY-MM-DD": [FoodEntry, ...] }
 FOOD_LOG: Dict[int, Dict[str, List[FoodEntry]]] = {}
 
-# простая БД продуктов на 100 г
 PRODUCTS = {
     "курица": {"kcal": 165, "protein": 31, "fat": 3.6, "carb": 0},
     "рис": {"kcal": 340, "protein": 7, "fat": 0.7, "carb": 76},
@@ -74,7 +72,6 @@ PRODUCTS = {
     "банан": {"kcal": 89, "protein": 1.1, "fat": 0.3, "carb": 23},
 }
 
-# уровни активности
 ACTIVITY_LEVELS = {
     "1": 1.2,
     "2": 1.375,
@@ -112,7 +109,6 @@ def main_keyboard() -> types.ReplyKeyboardMarkup:
 
 # ==== ХЕЛПЕРЫ ====
 def calc_daily_norm(weight: float, height: int, age: int, sex: str, activity: str, goal: str) -> DailyNorm:
-    # Миффлин-Сан Жеор
     if sex == "m":
         bmr = 10 * weight + 6.25 * height - 5 * age + 5
     else:
@@ -151,7 +147,7 @@ def get_today_stats(user_id: int) -> Tuple[Dict[str, float], List[FoodEntry]]:
         total["carb"] += e.carb
     return total, entries
 
-def add_food_entry(user_id: int, name: str, grams: int, product_info: Dict[str, float]) -> FoodEntry:
+def add_food_entry_from_100g(user_id: int, name: str, grams: int, product_info: Dict[str, float]) -> FoodEntry:
     factor = grams / 100.0
     entry = FoodEntry(
         name=name,
@@ -165,10 +161,20 @@ def add_food_entry(user_id: int, name: str, grams: int, product_info: Dict[str, 
     FOOD_LOG.setdefault(user_id, {}).setdefault(day, []).append(entry)
     return entry
 
+def add_food_entry_with_total_kcal(user_id: int, name: str, grams: int, kcal_total: float) -> FoodEntry:
+    entry = FoodEntry(
+        name=name,
+        grams=grams,
+        kcal=int(kcal_total),
+        protein=0.0,
+        fat=0.0,
+        carb=0.0,
+    )
+    day = today_key()
+    FOOD_LOG.setdefault(user_id, {}).setdefault(day, []).append(entry)
+    return entry
+
 def generate_calorie_ring(consumed: float, target: float, filename: str = "ring.png") -> str:
-    """
-    Генерирует PNG с кольцом калорий (как в iOS Activity).
-    """
     size = 600
     img = Image.new("RGB", (size, size), (20, 20, 30))
     draw = ImageDraw.Draw(img)
@@ -185,18 +191,15 @@ def generate_calorie_ring(consumed: float, target: float, filename: str = "ring.
     ]
 
     start_angle = -90
-    # фон-кольцо
     draw.arc(bbox, start=start_angle, end=start_angle + 359, fill=(60, 60, 80), width=thickness)
 
     if target <= 0:
         progress = 0
     else:
-        progress = min(consumed / target, 1.5)  # до 150% цели
+        progress = min(consumed / target, 1.5)
 
     end_angle = start_angle + int(360 * progress)
     color = (80, 200, 120) if progress <= 1 else (220, 80, 80)
-
-    # цветное кольцо прогресса
     draw.arc(bbox, start=start_angle, end=end_angle, fill=color, width=thickness)
 
     text = f"{int(consumed)}/{int(target)} ккал"
@@ -219,9 +222,6 @@ def generate_calorie_ring(consumed: float, target: float, filename: str = "ring.
     return filename
 
 def parse_meal_text_simple(text: str) -> Optional[Tuple[str, int]]:
-    """
-    Простой парсер: "продукт, граммы" -> (name, grams)
-    """
     if "," in text:
         name_part, grams_part = [p.strip() for p in text.split(",", 1)]
         try:
@@ -231,28 +231,75 @@ def parse_meal_text_simple(text: str) -> Optional[Tuple[str, int]]:
         return name_part.lower(), grams
     return None
 
-def generate_ai_advice(user: UserProfile, totals: Dict[str, float]) -> str:
-    """
-    Совет от ИИ (если есть ключ) или простой rule-based совет.
-    """
+# ==== ИИ: разбор текста приёма пищи ====
+def ai_parse_meal_from_text(raw_text: str) -> Optional[List[Dict]]:
     if not (OPENAI_API_KEY and openai):
-        # простая логика без ИИ
+        return None
+
+    prompt = f"""
+Пользователь описывает приём пищи на русском языке. Твоя задача — понять, что он съел, и оценить массу и калории.
+
+Верни ТОЛЬКО JSON-массив без лишнего текста в формате:
+[
+  {{"name": "название продукта", "grams": 150, "kcal": 320}},
+  ...
+]
+
+Правила:
+- "grams" — масса продукта в граммах (оцени, если точно не сказано).
+- "kcal" — суммарные калории для этой массы (не на 100 г, а именно для grams).
+- Используй адекватные средние значения калорий.
+- Не добавляй комментарии и текст вне JSON.
+
+Текст пользователя:
+\"\"\"{raw_text}\"\"\" 
+"""
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты диетолог и считаешь калории."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        content = resp.choices[0].message["content"].strip()
+        data = json.loads(content)
+        if not isinstance(data, list):
+            return None
+        result = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            grams = int(float(item.get("grams", 0)) or 0)
+            kcal = float(item.get("kcal", 0) or 0)
+            if name and grams > 0 and kcal > 0:
+                result.append({"name": name, "grams": grams, "kcal": kcal})
+        return result or None
+    except Exception:
+        return None
+
+def generate_ai_advice(user: UserProfile, totals: Dict[str, float]) -> str:
+    if not (OPENAI_API_KEY and openai):
         kcal = totals["kcal"]
         diff = user.daily.kcal - kcal
         if diff > 150:
-            return "Сегодня ты в лёгком дефиците по калориям — это хорошо для похудения. Постарайся добрать белок и не уходить в слишком сильный минус."
+            return "Сегодня ты в лёгком дефиците по калориям — это плюс для похудения. Постарайся добрать белок и не уходить в слишком сильный минус."
         elif diff < -150:
-            return "Сегодня есть превышение по калориям. На ужин сделай более лёгкий приём пищи и сократи быстрые углеводы."
+            return "Сегодня есть превышение по калориям. На ужин лучше сделать более лёгкий приём пищи и сократить быстрые углеводы."
         else:
             return "Сегодня ты почти в своей норме калорий. Продолжай в том же духе и следи за качеством продуктов."
 
     prompt = f"""
 Ты — диетолог. У пользователя цель: {user.goal}.
-Его параметры: возраст {user.age}, вес {user.weight} кг, рост {user.height} см.
-Его дневная норма: {user.daily.kcal} ккал, белки {user.daily.protein} г, жиры {user.daily.fat} г, углеводы {user.daily.carb} г.
+Параметры: возраст {user.age}, вес {user.weight} кг, рост {user.height} см.
+Дневная норма: {user.daily.kcal} ккал, белки {user.daily.protein} г, жиры {user.daily.fat} г, углеводы {user.daily.carb} г.
 Факт за сегодня: калории {totals['kcal']}, белки {totals['protein']}, жиры {totals['fat']}, углеводы {totals['carb']}.
 
-Дай короткий (до 4 предложений) понятный совет: что сегодня ок, что можно улучшить, и 1–2 конкретных рекомендации на следующий день.
+Дай короткий (до 4 предложений) понятный разбор: что сегодня хорошо, что можно улучшить и 1–2 конкретных рекомендации на завтра.
 Пиши по-русски, без обращения по имени и без смайлов.
 """
     try:
@@ -267,26 +314,43 @@ def generate_ai_advice(user: UserProfile, totals: Dict[str, float]) -> str:
         )
         return resp.choices[0].message["content"].strip()
     except Exception:
-        return "Не удалось получить совет от ИИ, попробуй позже. А пока держи ориентир: придерживайся своей дневной нормы калорий и следи, чтобы белок не проседал."
+        return "Не получилось получить совет от ИИ. Ориентируйся на свою дневную норму калорий и следи, чтобы белка было не меньше рассчитанного значения."
 
-# ==== РЕГИСТРАЦИЯ ====
+# ==== /start и /help ====
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     uid = message.from_user.id
     if uid in USERS:
         await message.answer(
-            "С возвращением! Я продолжаю считать твои калории.\n\n"
-            "Используй кнопки внизу, чтобы добавить приём пищи или посмотреть прогресс.",
+            "С возвращением 👋\n"
+            "Я продолжаю считать твои калории и помогать держать форму.\n\n"
+            "Нажми «➕ Приём пищи», чтобы добавить еду, или «📊 Мой день», чтобы посмотреть прогресс.",
             reply_markup=main_keyboard(),
         )
         return
     await message.answer(
-        "👋 Привет! Я твой личный бот-диетолог.\n"
-        "Давай настроим профиль.\n\n"
+        "👋 Привет! Я твой личный бот-диетолог.\n\n"
+        "Я буду считать калории, показывать прогресс в виде «кольца калорий» и давать рекомендации от ИИ.\n\n"
+        "Сначала настроим профиль.\n\n"
         "Сколько тебе полных лет?",
     )
     await Register.age.set()
 
+@dp.message_handler(commands=["help"])
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "Как пользоваться ботом:\n\n"
+        "1️⃣ Нажми /start и пройди регистрацию.\n"
+        "2️⃣ Добавляй еду через «➕ Приём пищи»:\n"
+        "   • текстом (можно свободно: «На завтрак 2 яйца и 150 г овсянки»)\n"
+        "   • голосовым (если подключён ИИ)\n"
+        "3️⃣ Смотри «📊 Мой день» — там кольцо калорий и список, что ты ел.\n"
+        "4️⃣ «📈 Прогресс» — статистика по дням.\n"
+        "5️⃣ «💬 Совет от ИИ» — разбор дня и рекомендации.",
+        reply_markup=main_keyboard(),
+    )
+
+# ==== РЕГИСТРАЦИЯ ====
 @dp.message_handler(state=Register.age)
 async def reg_age(message: types.Message, state: FSMContext):
     try:
@@ -342,7 +406,7 @@ async def reg_sex(message: types.Message, state: FSMContext):
         return
     await state.update_data(sex=sex)
     await message.answer(
-        "Выбери уровень активности (ответь цифрой):\n"
+        "Уровень активности (ответь цифрой):\n"
         "1 — сидячая работа, нет тренировок\n"
         "2 — 1–3 лёгкие тренировки в неделю\n"
         "3 — 3–5 тренировок\n"
@@ -394,14 +458,14 @@ async def reg_goal(message: types.Message, state: FSMContext):
 
     goal_text = {"loss": "Похудение", "keep": "Удержание веса", "gain": "Набор массы"}[goal]
     await message.answer(
-        "Готово! Я посчитал твою дневную норму:\n\n"
+        "Отлично, профиль настроен 👌\n\n"
         f"🎯 Цель: <b>{goal_text}</b>\n"
         f"🔥 Калории: <b>{daily.kcal}</b> ккал\n"
         f"🍗 Белки: <b>{daily.protein}</b> г\n"
         f"🧈 Жиры: <b>{daily.fat}</b> г\n"
         f"🍚 Углеводы: <b>{daily.carb}</b> г\n\n"
-        "Теперь просто отправляй, что ты ешь — текстом, голосом или фото.\n"
-        "Или нажми «➕ Приём пищи».",
+        "Теперь можно добавлять приёмы пищи через «➕ Приём пищи».\n"
+        "Можешь писать свободным текстом, отправлять голосовые (если подключён ИИ) или пользоваться форматом «продукт, граммы».",
         reply_markup=main_keyboard(),
     )
 
@@ -410,17 +474,17 @@ async def reg_goal(message: types.Message, state: FSMContext):
 async def start_add_meal(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if uid not in USERS:
-        await message.answer("Сначала нужно пройти регистрацию: /start")
+        await message.answer("Сначала пройди регистрацию: /start")
         return
     await message.answer(
         "Отправь, что ты сейчас съел(а):\n\n"
-        "• текстом: <code>плов, 250</code>\n"
-        "• голосовым (дальше можно прикрутить распознавание)\n"
-        "• фото тарелки (можно прикрутить распознавание по картинке)\n\n"
-        "Если пишешь текстом — лучше формат <b>продукт, граммы</b>.",
+        "• текстом (можно свободно: «2 яйца, 150 г риса и банан»)\n"
+        "• голосовым (я расшифрую и посчитаю — если подключён ИИ)\n\n"
+        "Формат «продукт, граммы» тоже работает: <code>плов, 250</code>.",
     )
     await AddMeal.waiting_input.set()
 
+# — текст
 @dp.message_handler(state=AddMeal.waiting_input, content_types=[types.ContentType.TEXT])
 async def add_meal_text(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -429,31 +493,61 @@ async def add_meal_text(message: types.Message, state: FSMContext):
         await message.answer("Сначала нужно пройти регистрацию: /start")
         return
 
-    parsed = parse_meal_text_simple(message.text.lower())
-    if not parsed:
+    raw = message.text.strip()
+
+    # 1. Сначала пробуем простой формат "продукт, граммы"
+    parsed = parse_meal_text_simple(raw.lower())
+    if parsed:
+        name, grams = parsed
+        if name not in PRODUCTS:
+            await message.answer(
+                f"Я ещё не знаю продукт <b>{name}</b>. Напиши его калорийность на 100 г (ккал), например: 210"
+            )
+            await state.update_data(temp_name=name, grams=grams)
+            return
+        entry = add_food_entry_from_100g(uid, name, grams, PRODUCTS[name])
+        totals, _ = get_today_stats(uid)
+        await state.finish()
         await message.answer(
-            "Не смог понять формат.\n"
-            "Напиши, пожалуйста, в виде: <b>продукт, граммы</b>, например: <code>плов, 250</code>."
+            f"Добавил: <b>{entry.name}</b>, {entry.grams} г — ~{entry.kcal} ккал.\n"
+            f"Сегодня уже примерно <b>{int(totals['kcal'])}</b> ккал из {USERS[uid].daily.kcal}.",
+            reply_markup=main_keyboard(),
         )
         return
 
-    name, grams = parsed
-    if name not in PRODUCTS:
-        await message.answer(
-            f"Я ещё не знаю продукт <b>{name}</b>. Напиши его калорийность на 100 г (ккал), например: 210"
-        )
-        await state.update_data(temp_name=name, grams=grams)
+    # 2. Если формат свободный — пробуем ИИ
+    ai_items = ai_parse_meal_from_text(raw)
+    if not ai_items:
+        if not (OPENAI_API_KEY and openai):
+            await message.answer(
+                "Свободный текст я понимаю только через ИИ, а ключ OpenAI пока не указан.\n\n"
+                "Сейчас используй формат: <b>продукт, граммы</b>, например: <code>плов, 250</code>."
+            )
+        else:
+            await message.answer(
+                "Не смог понять приём пищи даже через ИИ.\n"
+                "Попробуй написать чуть подробнее или в формате «продукт, граммы»."
+            )
         return
 
-    entry = add_food_entry(uid, name, grams, PRODUCTS[name])
+    added_entries: List[FoodEntry] = []
+    total_kcal_added = 0
+    for item in ai_items:
+        e = add_food_entry_with_total_kcal(uid, item["name"], item["grams"], item["kcal"])
+        added_entries.append(e)
+        total_kcal_added += e.kcal
+
     totals, _ = get_today_stats(uid)
     await state.finish()
-    await message.answer(
-        f"Добавил: <b>{entry.name}</b>, {entry.grams} г — ~{entry.kcal} ккал.\n"
-        f"Сегодня уже примерно <b>{int(totals['kcal'])}</b> ккал.",
-        reply_markup=main_keyboard(),
-    )
 
+    lines = ["Я понял так:\n"]
+    for e in added_entries:
+        lines.append(f"• {e.name}, {e.grams} г — ~{e.kcal} ккал")
+    lines.append(f"\nВсего за этот приём: <b>{int(total_kcal_added)}</b> ккал.")
+    lines.append(f"Съедено за день: <b>{int(totals['kcal'])}</b> из {USERS[uid].daily.kcal} ккал.")
+    await message.answer("\n".join(lines), reply_markup=main_keyboard())
+
+# — голос
 @dp.message_handler(state=AddMeal.waiting_input, content_types=[types.ContentType.VOICE])
 async def add_meal_voice(message: types.Message, state: FSMContext):
     uid = message.from_user.id
@@ -462,35 +556,70 @@ async def add_meal_voice(message: types.Message, state: FSMContext):
         await message.answer("Сначала нужно пройти регистрацию: /start")
         return
 
-    # здесь можно подключить Whisper / GPT-4o для распознавания речи из voice
-    await message.answer(
-        "Я получил голосовое. В продакшене здесь можно включить ИИ для распознавания.\n"
-        "Чтобы сейчас не ломать логику, отправь, пожалуйста, то же самое текстом в формате <b>продукт, граммы</b>."
-    )
-
-@dp.message_handler(state=AddMeal.waiting_input, content_types=[types.ContentType.PHOTO])
-async def add_meal_photo(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
-    if uid not in USERS:
+    if not (OPENAI_API_KEY and openai):
         await state.finish()
-        await message.answer("Сначала нужно пройти регистрацию: /start")
+        await message.answer(
+            "Чтобы понимать голосовые, нужен подключённый OpenAI API ключ (переменная окружения OPENAI_API_KEY).\n"
+            "Пока что отправь текстом, например: <code>2 яйца, 150 г риса и банан</code>.",
+            reply_markup=main_keyboard(),
+        )
         return
 
-    # здесь можно подключить модель CV / GPT-4o Vision для анализа фото
-    await message.answer(
-        "Я получил фото еды. Здесь можно подключить ИИ, который распознаёт блюда и порции.\n"
-        "Пока что отправь, пожалуйста, приём пищи текстом в формате <b>продукт, граммы</b>."
-    )
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file.file_path, buf)
+        buf.seek(0)
+        buf.name = "audio.ogg"
 
+        transcript = openai.Audio.transcribe("whisper-1", buf, language="ru")
+        text = transcript["text"]
+    except Exception:
+        await state.finish()
+        await message.answer(
+            "Не удалось распознать голосовое. Попробуй ещё раз или отправь текстом.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    ai_items = ai_parse_meal_from_text(text)
+    if not ai_items:
+        await state.finish()
+        await message.answer(
+            "Я расшифровал голосовое, но не смог понять, что именно ты ел.\n"
+            "Попробуй ещё раз сказать чётко или отправь текстом.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    added_entries: List[FoodEntry] = []
+    total_kcal_added = 0
+    for item in ai_items:
+        e = add_food_entry_with_total_kcal(uid, item["name"], item["grams"], item["kcal"])
+        added_entries.append(e)
+        total_kcal_added += e.kcal
+
+    totals, _ = get_today_stats(uid)
+    await state.finish()
+
+    lines = [f"Я понял из голосового:\n\n🗣 «{text}»\n"]
+    for e in added_entries:
+        lines.append(f"• {e.name}, {e.grams} г — ~{e.kcal} ккал")
+    lines.append(f"\nВсего за приём: <b>{int(total_kcal_added)}</b> ккал.")
+    lines.append(f"Съедено за день: <b>{int(totals['kcal'])}</b> из {USERS[uid].daily.kcal} ккал.")
+    await message.answer("\n".join(lines), reply_markup=main_keyboard())
+
+# — любые другие типы (фото и т.п.) пока без ИИ
 @dp.message_handler(state=AddMeal.waiting_input)
 async def add_meal_other(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer(
-        "Поддерживаются текст, голос и фото. Попробуй ещё раз через «➕ Приём пищи».",
+        "Сейчас я понимаю текст и голос. Фото еды можно будет подключить позже через ИИ.\n"
+        "Попробуй отправить приём пищи текстом или голосом.",
         reply_markup=main_keyboard(),
     )
 
-# ввод калорийности нового продукта (когда бот спросил)
+# ввод калорийности нового продукта
 @dp.message_handler(lambda m: m.text and m.text.isdigit(), state="*")
 async def handle_custom_kcal(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -509,7 +638,7 @@ async def handle_custom_kcal(message: types.Message, state: FSMContext):
     grams = data["grams"]
     PRODUCTS[name] = {"kcal": kcal100, "protein": 0.0, "fat": 0.0, "carb": 0.0}
     uid = message.from_user.id
-    entry = add_food_entry(uid, name, grams, PRODUCTS[name])
+    entry = add_food_entry_from_100g(uid, name, grams, PRODUCTS[name])
     totals, _ = get_today_stats(uid)
     await state.finish()
     await message.answer(
@@ -518,7 +647,7 @@ async def handle_custom_kcal(message: types.Message, state: FSMContext):
         reply_markup=main_keyboard(),
     )
 
-# ==== МОЙ ДЕНЬ (кольцо калорий) ====
+# ==== МОЙ ДЕНЬ ====
 @dp.message_handler(lambda m: m.text == "📊 Мой день")
 async def show_today(message: types.Message):
     uid = message.from_user.id
@@ -571,7 +700,7 @@ async def show_progress(message: types.Message):
 
     await message.answer("\n".join(lines), reply_markup=main_keyboard())
 
-# ==== ПРОФИЛЬ / ЦЕЛЬ ====
+# ==== ПРОФИЛЬ ====
 @dp.message_handler(lambda m: m.text == "⚙️ Профиль")
 async def show_profile(message: types.Message):
     uid = message.from_user.id
